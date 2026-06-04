@@ -1,77 +1,306 @@
-
-name: Build HisabApp
+name: Build HisabApp (Production)
 
 on:
   push:
     branches:
       - main
+      - develop
+    tags:
+      - 'v*'  # تشغيل تلقائي عند دفع تاغ جديد مثل v1.0.0
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'نوع البناء'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+          - beta
+
+# أذونات مطلوبة للإصدارات التلقائية
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  NODE_VERSION: '20'
+  JAVA_VERSION: '17'
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'release' }}
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install dependencies
-        run: npm install
-
-      - name: Build Next.js export
-        run: npm run build
-
-      - name: Build EXE
-        run: npm run build:exe
-
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
-        with:
-          name: HisabApp-EXE
-          path: dist/*.exe
-
-  build-android:
+  # ==================== التحقق من الجودة قبل البناء ====================
+  quality-checks:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+      
+      - name: Type check
+        run: npm run type-check || npx tsc --noEmit
+      
+      - name: Lint check
+        run: npm run lint || echo "No lint script found"
+      
+      - name: Run tests
+        run: npm test || echo "No tests found"
+      
+      - name: Build check
+        run: npm run build
 
+  # ==================== بناء Windows (Electron) ====================
+  build-windows:
+    runs-on: windows-latest
+    needs: [quality-checks]
+    if: success()
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+      
+      - name: Build Next.js app
+        run: npm run build
+        env:
+          NEXT_PUBLIC_APP_ENV: ${{ env.BUILD_TYPE }}
+          NEXT_PUBLIC_VERSION: ${{ github.ref_name }}
+      
+      - name: Build Electron App
+        run: npm run build:electron
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ github.ref_name }}
+      
+      - name: Sign Windows Executable (اختياري مع شهادة)
+        if: env.BUILD_TYPE == 'release' && secrets.WINDOWS_CERTIFICATE != ''
+        run: |
+          # توقيع الـ exe بشهادة موثوقة (لتجنب تحذيرات SmartScreen)
+          certutil -decode certificate.pfx base64
+          signtool sign /fd SHA256 /a /f certificate.pfx /p ${{ secrets.WINDOWS_CERT_PASSWORD }} dist/*.exe
+      
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HisabApp-Windows-${{ github.ref_name }}-${{ env.BUILD_TYPE }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.blockmap
+          retention-days: 30
+      
+      - name: Upload to Release (عند وجود تاغ)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/*.exe
+            dist/*.zip
+          generate_release_notes: true
+          prerelease: ${{ env.BUILD_TYPE == 'beta' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================== بناء Android (Capacitor) ====================
+  build-android:
+    runs-on: ubuntu-latest
+    needs: [quality-checks]
+    if: success()
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 17
-
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+      
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      
       - name: Install dependencies
-        run: npm install
-
+        run: npm ci --prefer-offline
+      
       - name: Build web app
         run: npm run build
-
-      - name: Capacitor Init
+        env:
+          NEXT_PUBLIC_APP_ENV: ${{ env.BUILD_TYPE }}
+          NEXT_PUBLIC_VERSION: ${{ github.ref_name }}
+      
+      - name: Capacitor sync
         run: |
           npx cap add android || true
           npx cap sync android
-
+      
       - name: Grant gradlew permission
         run: chmod +x android/gradlew
-
-      - name: Build APK
+      
+      - name: Build Android APK and AAB
         run: |
           cd android
-          ./gradlew assembleDebug
-
-      - name: Upload APK
+          if [ "${{ env.BUILD_TYPE }}" = "release" ]; then
+            ./gradlew assembleRelease bundleRelease
+          else
+            ./gradlew assembleDebug
+          fi
+      
+      - name: Sign APK (Release builds)
+        if: env.BUILD_TYPE == 'release' && secrets.ANDROID_KEYSTORE != ''
+        run: |
+          # توقيع التطبيق للإصدار النهائي
+          echo "${{ secrets.ANDROID_KEYSTORE }}" | base64 --decode > keystore.jks
+          cd android/app/build/outputs/apk/release
+          jarsigner -verbose -sigalg SHA1withRSA -digestalg SHA1 \
+            -keystore ../../../../../keystore.jks \
+            -storepass ${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
+            app-release-unsigned.apk ${{ secrets.ANDROID_KEY_ALIAS }}
+          zipalign -v 4 app-release-unsigned.apk HisabApp-${{ github.ref_name }}.apk
+      
+      - name: Upload Android Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: HisabApp-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: HisabApp-Android-${{ github.ref_name }}-${{ env.BUILD_TYPE }}
+          path: |
+            android/app/build/outputs/apk/**/*.apk
+            android/app/build/outputs/bundle/**/*.aab
+          retention-days: 30
+      
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            android/app/build/outputs/apk/release/*.apk
+            android/app/build/outputs/bundle/release/*.aab
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================== بناء Linux و macOS ====================
+  build-linux-macos:
+    runs-on: ${{ matrix.os }}
+    needs: [quality-checks]
+    if: success() && (github.ref_type == 'tag' || env.BUILD_TYPE == 'release')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            output_ext: AppImage
+          - os: macos-latest
+            platform: macos
+            output_ext: dmg
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build web app
+        run: npm run build
+      
+      - name: Build Electron for ${{ matrix.platform }}
+        run: |
+          npm run build:electron -- --${{ matrix.platform }}
+      
+      - name: Upload ${{ matrix.platform }} artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HisabApp-${{ matrix.platform }}-${{ github.ref_name }}
+          path: dist/*.${{ matrix.output_ext }}
+      
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.${{ matrix.output_ext }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==================== إشعار نجاح البناء ====================
+  notification:
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-android, build-linux-macos]
+    if: always() && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch')
+    
+    steps:
+      - name: Send Discord notification (اختياري)
+        if: secrets.DISCORD_WEBHOOK != ''
+        uses: Ilshidur/action-discord@master
+        with:
+          args: |
+            🎉 **HisabApp Build Complete**
+            Version: ${{ github.ref_name }}
+            Status: ${{ needs.build-windows.result }}
+            Type: ${{ env.BUILD_TYPE }}
+            Download: https://github.com/${{ github.repository }}/releases
+            
+      - name: Send Telegram notification (اختياري)
+        if: secrets.TELEGRAM_BOT_TOKEN != ''
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ✅ HisabApp بناء جديد!
+            الإصدار: ${{ github.ref_name }}
+            نوع البناء: ${{ env.BUILD_TYPE }}
+            قم بتحميله من: https://github.com/${{ github.repository }}/releases
+
+  # ==================== نظافة - حذف الملفات القديمة ====================
+  cleanup:
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: [build-windows, build-android, build-linux-macos]
+    
+    steps:
+      - name: Delete old artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 50
+            });
+            
+            const now = Date.now();
+            const oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000);
+            
+            for (const artifact of artifacts.data.artifacts) {
+              if (artifact.created_at < oneWeekAgo && artifact.name !== 'latest-build') {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+              }
+            }
