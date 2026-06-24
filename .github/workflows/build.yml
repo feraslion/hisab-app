@@ -1,49 +1,185 @@
-name: Build Hisab App (Desktop & Mobile)
 
+name: e2e
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+      - develop
+    paths:
+      - 'upload'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-desktop:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: npm ci
-      - run: npm run build
-      - name: Build Windows Installer
-        run: npx electron-builder --win
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hisab-windows
-          path: dist/*.exe
-
-  build-android:
+  frontend:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outer_projects/app
+    steps:
+      - name: Harden runners
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: egres
+          disable-network-policy: true
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dump Git HEAD for versioning
+        id: hash
+        run: |
+          echo "VERSION=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set git HEAD
+        run: |
+          git checkout main
+          git pull origin main
+          git config user.name "CI"
+          git config user.email "ci@accounting-app.com"
+
+      - name: Cache Flutter packages
+        uses: dart-lang/setup-flutter@v1
+
+      - name: Install Flutter dependencies
+        run: |
+          flutter pub get
+
+      - name: Generate Fuchsia resources
+        run: |
+          flutter fuchsia pub get
+          flutter fuchsia pub build
+
+      - name: Build Android App Bundle & APK
+        run: |
+          flutter build apk --release -t bin/main.dart
+
+      - name: Build Flutter Web
+        run: |
+          flutter build web -t bin/main.dart
+
+      - name: Test iOS on simulator
+        run: |
+          flutter install ios
+          flutter run -d darwin-x86_64-simulator
+
+      - name: Build macOS release
+        run: |
+          flutter build macos -t bin/main.dart
+
+    outputs:
+      frontend_result: ${{ steps.frontend_result.iterations.count }}
+
+  backend:
+    needs: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outer_projects/backend
+    steps:
+      - name: Harden runners
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: egres
+          disable-network-policy: true
+
+      - uses: actions/checkout@v4
+
+      - name: Git setup
+        run: |
+          git config user.email "ci@example.com"
+
+      - name: Show nginx version
+        run: |
+          echo "ENVOY_VERSION=$(nginx -v)"
+
+      - name: Build Docker images
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: false
+
+      - name: Run application with resources
+        run: |
+          docker compose up -d
+
+      - name: Install Node modules
+        uses: badge-maker/setup-action@v1
+        env:
+          version: ${{ steps.hash.outputs.version }}
+
+      - name: Run backend tests
+        run: |
+          pip install requests poetry python-slugify sreparse colorama
+          cd backend/src && npm install
+          npm run db:seed-images
+          npm run db:migrate
+          npm run server -- -ddd
+        env:
+          env: .
+
+      - name: Systemd test
+        run: |
+          /etc/systemd/system/backend.service stop
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18.x"
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: frontend-win
+          path: app/release/*.exe
+          retention-days: 30
+
+    outputs:
+      build_number: ${{ steps.build_number.outputs.value }}
+
+  zap:
+    needs: backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: outer_projects/app
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - uses: actions/setup-java@v3
-        with:
-          distribution: 'zulu'
-          java-version: '17'
-      - run: npm ci
-      - run: npm run build
-      - name: Setup Android Environment
+
+      - name: Set git HEAD
         run: |
-          npm install -g @capacitor/cli @capacitor/android
-          npx cap init "Hisab App" com.hisab.app
-          npx cap add android
-      - name: Build APK
+          git config user.name "CI"
+          git config user.email "ci@zap.com"
+          git checkout main
+
+      - name: Create version file
         run: |
-          cd android
-          ./gradlew assembleDebug
-      - uses: actions/upload-artifact@v4
-        with:
-          name: hisab-android-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p art/artifacts/zap
+          echo "# ZAP Desktop
+          ## Build ${{ needs.backend.outputs.build_number }}
+" > app/art/artifacts/zap/proof
+
+      - name: ZIP integration files
+        working-directory: app/art/artifacts/zap
+        run: |
+          zip -r /dev/stdout ........
+
+Type within a text editor: ```GoRouter className="
